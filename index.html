@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>うそつきパス</title>
+<style>
+  body { font-family: sans-serif; margin: 0; background: #20242e; color: #f2f2f2; }
+  main { max-width: 560px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  .sub { color: #aab; font-size: 13px; margin-bottom: 12px; }
+  input, button { font-size: 16px; padding: 10px; border-radius: 8px; border: 1px solid #555; }
+  input { background: #14161c; color: #fff; width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+  button { background: #3a4152; color: #fff; cursor: pointer; }
+  button.primary { background: #b3541e; border-color: #b3541e; font-weight: bold; }
+  button:disabled { opacity: .45; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .card { background: #2b303d; border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+  .turn { outline: 2px solid #ffb347; }
+  .danger { outline: 2px solid #e5484d; }
+  .pile { font-size: 14px; line-height: 1.9; }
+  .hand { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: #14161c; border: 2px solid #555; border-radius: 10px; padding: 8px 10px; font-size: 16px; color: #fff; }
+  .chip.sel { border-color: #ffb347; background: #4a3a1a; }
+  .big { font-size: 44px; text-align: center; padding: 10px 0; }
+  .decl { text-align: center; font-size: 17px; }
+  .log { font-size: 13px; color: #ccd; line-height: 1.7; }
+  .warn { color: #ffb3b5; }
+  .ok { color: #9fe8a9; }
+  details { margin-top: 16px; color: #bbc; font-size: 14px; line-height: 1.7; }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+const KINDS = [
+  { id: 'roach',    name: 'ゴキブリ', emoji: '🪳' },
+  { id: 'rat',      name: 'ネズミ',   emoji: '🐀' },
+  { id: 'bat',      name: 'コウモリ', emoji: '🦇' },
+  { id: 'frog',     name: 'カエル',   emoji: '🐸' },
+  { id: 'scorpion', name: 'サソリ',   emoji: '🦂' },
+  { id: 'snake',    name: 'ヘビ',     emoji: '🐍' },
+  { id: 'spider',   name: 'クモ',     emoji: '🕷️' },
+  { id: 'mosquito', name: 'カ',       emoji: '🦟' },
+];
+const K = id => KINDS.find(k => k.id === id);
+let S = null;            // サーバー状態
+let me = JSON.parse(localStorage.getItem('up_me') || 'null');
+let sel = { card: null, declared: null, target: null };
+let lastSig = '';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'エラー');
+  return j;
+}
+const post = (path, data) => api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
+const authBody = extra => Object.assign({ code: me.code, playerId: me.playerId, token: me.token }, extra || {});
+
+async function poll() {
+  if (!me) return render();
+  try {
+    S = await api(`/api/state?room=${me.code}&player=${me.playerId}&token=${me.token}`);
+    render();
+  } catch (e) { /* 次のポーリングで再試行 */ }
+}
+setInterval(poll, 1000);
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function pileHtml(pile) {
+  if (!pile) return '';
+  const parts = KINDS.filter(k => pile[k.id] > 0).map(k => `${k.emoji}×${pile[k.id]}`);
+  return parts.length ? parts.join('　') : '（なし）';
+}
+function dangerOf(pile) { return pile && KINDS.some(k => pile[k.id] >= 3); }
+
+function render() {
+  const app = document.getElementById('app');
+  // 入力中は再描画しない（キーボードが閉じる問題の対策）
+  const ae = document.activeElement;
+  const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT');
+  if (!me || !S) {
+    if (typing) return;
+    app.innerHTML = homeHtml();
+    return;
+  }
+  const sig = JSON.stringify([S.phase, S.players, S.me, S.pending, S.turn, S.noPassBack, S.log && S.log.length, S.loser, sel]);
+  if (sig === lastSig) return;
+  if (typing && S.phase === 'lobby') return;
+  lastSig = sig;
+  if (S.phase === 'lobby') app.innerHTML = lobbyHtml();
+  else app.innerHTML = gameHtml();
+}
+
+function homeHtml() {
+  return `<h1>🤥 うそつきパス</h1>
+  <div class="sub">嫌なカードを「これは◯◯」と宣言して押し付け合うブラフゲーム。3〜6人。</div>
+  <input id="name" placeholder="名前" maxlength="12">
+  <button class="primary" style="width:100%" onclick="create()">ルームを作る</button>
+  <div style="height:14px"></div>
+  <input id="code" placeholder="ルームコード（4文字）" maxlength="4" style="text-transform:uppercase">
+  <button style="width:100%" onclick="join()">ルームコードで参加</button>
+  <details><summary>ルール</summary>
+    手札から1枚選び、誰かに「これは◯◯」と宣言して伏せて渡す（嘘でもいい）。<br>
+    渡された人は<b>中を見る前に</b>「受け取る」か「ダウト」を選ぶ。<br>
+    ・受け取る：自分だけ中身を見て、手札から1枚を宣言し直して別の人へ（渡してきた人には返せない）<br>
+    ・ダウト：公開して、嘘だったら渡した人が、本当だったらダウトした人が、そのカードを自分の前に表で置く<br>
+    自分の前に同じ種類が4枚集まったら負け。手札が尽きたら、前のカードが一番多い人が負け。
+  </details>`;
+}
+async function create() {
+  const name = document.getElementById('name').value.trim() || '名無し';
+  try { me = await post('/api/create', { name }); me.code && localStorage.setItem('up_me', JSON.stringify(me)); lastSig = ''; poll(); }
+  catch (e) { alert(e.message); }
+}
+async function join() {
+  const name = document.getElementById('name').value.trim() || '名無し';
+  const code = document.getElementById('code').value.trim().toUpperCase();
+  try { me = await post('/api/join', { name, code }); localStorage.setItem('up_me', JSON.stringify(me)); lastSig = ''; poll(); }
+  catch (e) { alert(e.message); }
+}
+function leave() { localStorage.removeItem('up_me'); me = null; S = null; lastSig = ''; render(); }
+
+function lobbyHtml() {
+  const ps = S.players.map(p => `<div class="card">${p.isMe ? '🟢' : '⚪'} ${esc(p.name)}${p.isBot ? '（ボット）' : ''}${p.id === S.players[0].id ? '' : ''}</div>`).join('');
+  return `<h1>🤥 うそつきパス</h1>
+  <div class="sub">ルームコード：<b style="font-size:20px;color:#fff">${S.code}</b>（友達に共有してね）</div>
+  ${ps}
+  <div class="row">
+    ${S.isHost ? `<button onclick="addBot()">ボット追加</button><button class="primary" onclick="start()" ${S.players.length < 3 ? 'disabled' : ''}>開始（${S.players.length}人）</button>` : '<span class="sub">ホストの開始待ち…</span>'}
+    <button onclick="leave()">退出</button>
+  </div>
+  <div class="sub" style="margin-top:8px">3人から開始できます。足りなければボットで埋めてね。</div>`;
+}
+async function addBot() { try { await post('/api/addbot', authBody()); poll(); } catch (e) { alert(e.message); } }
+async function start() { try { await post('/api/start', authBody()); sel = { card: null, declared: null, target: null }; poll(); } catch (e) { alert(e.message); } }
+async function restart() { try { await post('/api/restart', authBody()); sel = { card: null, declared: null, target: null }; lastSig = ''; poll(); } catch (e) { alert(e.message); } }
+
+function gameHtml() {
+  const nameOf = id => (S.players.find(p => p.id === id) || {}).name || '?';
+  let h = `<h1>🤥 うそつきパス</h1>`;
+  // プレイヤー一覧（前のカード＝公開情報）
+  h += S.players.map(p => `<div class="card ${p.isTurn ? 'turn' : ''} ${dangerOf(p.pile) ? 'danger' : ''}">
+    <b>${esc(p.name)}</b>${p.isMe ? '（あなた）' : ''}　🂠 手札${p.handCount}枚
+    <div class="pile">前：${pileHtml(p.pile)}</div></div>`).join('');
+
+  if (S.phase === 'finished') {
+    const loser = S.players.find(p => p.id === S.loser);
+    h += `<div class="card"><div class="big">🏁</div>
+      <div class="decl warn"><b>${esc(loser ? loser.name : '?')} の負け！</b></div>
+      <div class="decl">${esc(S.loseReason || '')}</div>
+      ${S.isHost ? '<button class="primary" style="width:100%;margin-top:8px" onclick="restart()">ロビーに戻る</button>' : '<div class="sub" style="text-align:center">ホストがロビーに戻すのを待ってます</div>'}
+    </div>`;
+  } else if (S.phase === 'decide' && S.pending) {
+    const from = nameOf(S.pending.from), to = nameOf(S.pending.to), d = K(S.pending.declared);
+    h += `<div class="card"><div class="big">🂠</div>
+      <div class="decl">${esc(from)} → ${esc(to)}<br>「これは ${d.emoji}<b>${d.name}</b>」</div>`;
+    if (S.pending.to === me.playerId) {
+      h += `<div class="decl warn" style="margin:8px 0">中を見る前に決めてね</div>
+        <div class="row" style="justify-content:center">
+          <button class="primary" onclick="decide('accept')">受け取る（中を見る）</button>
+          <button onclick="decide('doubt')">ダウト！</button>
+        </div>`;
+    } else if (S.pending.from === me.playerId) {
+      const c = K(S.pending.card);
+      h += `<div class="decl">あなたは ${c.emoji}${c.name} を渡した。${esc(to)} が考え中…</div>`;
+    } else {
+      h += `<div class="decl">${esc(to)} が考え中…</div>`;
+    }
+    h += `</div>`;
+  } else if (S.phase === 'pass') {
+    if (S.turn === me.playerId) {
+      if (S.me.lastReceived) { const c = K(S.me.lastReceived); h += `<div class="card ok">受け取ったカードは ${c.emoji}<b>${c.name}</b> でした（あなただけが見てる）</div>`; }
+      h += `<div class="card"><b>あなたの番：渡すカードを選ぶ</b>
+        <div class="hand" style="margin:8px 0">${KINDS.filter(k => S.me.hand[k.id] > 0).map(k =>
+          `<button class="chip ${sel.card === k.id ? 'sel' : ''}" onclick="pickCard('${k.id}')">${k.emoji}${k.name} ×${S.me.hand[k.id]}</button>`).join('')}</div>`;
+      if (sel.card) {
+        const c = K(sel.card);
+        h += `<div style="margin:6px 0">宣言（「これは…」と名乗る種類）：</div>
+          <div class="hand">${KINDS.map(k => `<button class="chip ${sel.declared === k.id ? 'sel' : ''}" onclick="pickDeclared('${k.id}')">${k.emoji}${k.name}</button>`).join('')}</div>
+          <div style="margin:10px 0 6px">渡す相手：</div>
+          <div class="hand">${S.players.filter(p => !p.isMe && p.id !== S.noPassBack).map(p =>
+            `<button class="chip ${sel.target === p.id ? 'sel' : ''}" onclick="pickTarget('${p.id}')">${esc(p.name)}</button>`).join('')}</div>
+          ${S.noPassBack ? `<div class="sub">${esc(nameOf(S.noPassBack))} には返せません</div>` : ''}
+          <button class="primary" style="width:100%;margin-top:10px" ${sel.declared && sel.target ? '' : 'disabled'} onclick="doPass()">「これは ${sel.declared ? K(sel.declared).emoji + K(sel.declared).name : ''}」と言って渡す</button>`;
+      }
+      h += `</div>`;
+    } else {
+      h += `<div class="card decl">${esc(nameOf(S.turn))} が渡すカードを選んでいます…</div>`;
+    }
+  }
+  // 自分の手札（自分の番以外でも見られるように）
+  if (S.phase !== 'finished' && !(S.phase === 'pass' && S.turn === me.playerId)) {
+    h += `<div class="card"><b>あなたの手札</b><div class="pile">${KINDS.filter(k => S.me.hand[k.id] > 0).map(k => `${k.emoji}${k.name}×${S.me.hand[k.id]}`).join('　') || '（なし）'}</div></div>`;
+  }
+  h += `<div class="card log">${(S.log || []).slice(-10).map(esc).join('<br>')}</div>`;
+  h += `<button onclick="leave()">退出（観戦終了）</button>`;
+  return h;
+}
+function pickCard(id) { sel.card = id; if (!sel.declared) sel.declared = id; lastSig = ''; render(); }
+function pickDeclared(id) { sel.declared = id; lastSig = ''; render(); }
+function pickTarget(id) { sel.target = id; lastSig = ''; render(); }
+async function doPass() {
+  try { await post('/api/action', authBody({ action: 'pass', card: sel.card, target: sel.target, declared: sel.declared })); sel = { card: null, declared: null, target: null }; poll(); }
+  catch (e) { alert(e.message); }
+}
+async function decide(choice) {
+  try { await post('/api/action', authBody({ action: 'decide', choice })); poll(); }
+  catch (e) { alert(e.message); }
+}
+render();
+poll();
+</script>
+</body>
+</html>
